@@ -81,8 +81,8 @@ def run_model_v2(financial_data,
     )
 
     return {
-        "stability_score": l1.S_E(),
-        "financial_zone": l1.zone()
+        "stability_score": l1.S_E,
+        "financial_zone": l1.zone
     }
 
 
