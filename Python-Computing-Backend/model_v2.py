@@ -6,13 +6,17 @@ Consumes DebtPortfolio.to_model_v2_inputs() + user profile inputs.
 
 Changes from original:
   - Zone classification unified: S_E only (F_net-based zone removed)
-  - epsilon removed
-  - escape_score_zone removed
+  - epsilon removed / escape_score_zone removed
   - LDER denominator fixed: I * 12 for annualised income
   - t_star_adjusted low-momentum branch stretches by x1.50
   - Layer 3 removed (debt classification absorbed into portfolio tool)
   - true_event_horizon_warning() uses Lifetime Income Commitment Ratio R
-    — no peak age, no career curve assumptions, fully audit-proof
+
+V.2 formula updates:
+  - β(s) = 1 + (κ−1) × (10−s) / 9   where κ = P*/F_g
+  - S_E  = (P_eff − F_g) / (P* − F_g) × 100
+           where P_eff = P + max(F_net, 0)
+  - Zone thresholds derived from κ (person-specific, no magic numbers)
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ class ModelV2Layer1:
       P              — total monthly debt payment  (from DebtPortfolio)
       D              — total outstanding debt       (from DebtPortfolio)
       r              — weighted avg effective annual rate (from DebtPortfolio)
-      behavior_score — 0-10 (from 5-question behavioral assessment)
+      behavior_score — 1-10 (from 5-question behavioral assessment)
       E_fund         — emergency fund balance
       months_on_budget — 0-6 (last 6 months on budget)
     """
@@ -58,10 +62,27 @@ class ModelV2Layer1:
     # ── Three Forces ──────────────────────────────────────────────────────────
 
     @property
+    def kappa(self) -> float:
+        """κ = P* / F_g — escape velocity multiple.
+        How many times larger the escape payment is than the orbit-lock payment.
+        """
+        fg = self.F_g
+        if fg <= 0:
+            return 1.0   # no debt gravity → neutral multiplier
+        ps = self.P_star
+        if ps <= 0:
+            return 1.0
+        return ps / fg
+
+    @property
     def beta(self) -> float:
-        """β = 1 + behavior_score / 10  ∈ [1.0, 2.0]"""
-        # score 1–10 where 10=best (lowest drag), 1=worst (highest drag)
-        return 2 - max(1.0, min(10.0, self.behavior_score)) / 10
+        """β(s) = 1 + (κ − 1) × (10 − s) / 9
+
+        s=10 (perfect discipline): β = 1.0  — no drag amplification.
+        s=1  (fully impulsive):    β = κ    — full escape-cost amplification.
+        """
+        s = max(1.0, min(10.0, self.behavior_score))
+        return 1 + (self.kappa - 1) * (10 - s) / 9
 
     @property
     def F_p(self) -> float:
@@ -86,34 +107,62 @@ class ModelV2Layer1:
     # ── Escape Score ──────────────────────────────────────────────────────────
 
     @property
+    def P_eff(self) -> float:
+        """P_eff = P + max(F_net, 0)
+        Effective payment = contractual payment + any available surplus.
+        """
+        return self.P + max(self.F_net, 0)
+
+    @property
     def B_s(self) -> float:
-        """Safety buffer bonus: B_s = min(10, E_fund / (3 * E_n) * 10)"""
+        """Safety buffer: B_s = min(10, E_fund / (3*E_n) * 10)
+        Retained for diagnostics; no longer part of S_E formula.
+        """
         if self.E_n <= 0:
             return 0.0
         return min(10.0, (self.E_fund / (3 * self.E_n)) * 10)
 
     @property
     def S_E(self) -> float:
-        """Escape Score: S_E = (F_net / I) * 100 + B_s"""
-        if self.I <= 0:
-            return -100.0
-        return (self.F_net / self.I) * 100 + self.B_s
+        """S_E = (P_eff − F_g) / (P* − F_g) × 100
 
-    # ── Orbital Zone (S_E only — single source of truth) ─────────────────────
+        Normalised payment coverage ratio:
+          S_E ≥ 100  →  Escape  (P_eff ≥ P*)
+          S_E =   0  →  orbit-lock boundary (P_eff = F_g)
+          S_E <   0  →  Black Hole (payment can't cover interest)
+        """
+        fg     = self.F_g
+        p_star = self.P_star
+        if p_star <= fg:
+            return -100.0 if self.D > 0 else 0.0
+        return (self.P_eff - fg) / (p_star - fg) * 100
+
+    # ── Orbital Zone ─────────────────────────────────────────────────────────
+
+    @property
+    def marginal_threshold(self) -> float:
+        """100 / (√κ + 1) — lower boundary of Marginal zone.
+        Derived from the geometric mean √(F_g × P*) mapped to S_E space.
+        """
+        k = self.kappa
+        if k <= 0:
+            return 50.0
+        return 100 / (math.sqrt(k) + 1)
 
     @property
     def zone(self) -> str:
-        s = self.S_E
-        if s > 20:     return "escape_trajectory"
-        elif s >= 5:   return "marginal_escape"
-        elif s >= -10: return "debt_orbit"
-        else:          return "black_hole"
+        se  = self.S_E
+        thr = self.marginal_threshold
+        if se >= 100:   return "escape"
+        elif se >= thr: return "marginal"
+        elif se >= 0:   return "debt_orbit"
+        else:           return "black_hole"
 
     ZONE_DISPLAY = {
-        "escape_trajectory": "🚀 Escape Trajectory",
-        "marginal_escape":   "🌕 Marginal Escape",
-        "debt_orbit":        "⚠️  Debt Orbit",
-        "black_hole":        "🕳️  Black Hole",
+        "escape":     "🚀 Escape",
+        "marginal":   "⚠️  Marginal",
+        "debt_orbit": "🔄 Debt Orbit",
+        "black_hole": "⚫ Black Hole",
     }
 
     @property
@@ -203,13 +252,16 @@ class ModelV2Layer1:
 
     def compute(self) -> dict:
         return {
+            "kappa": round(self.kappa, 4),
             "beta":  round(self.beta, 3),
             "F_p":   round(self.F_p, 2),
             "F_g":   round(self.F_g, 2),
             "F_d":   round(self.F_d, 2),
             "F_net": round(self.F_net, 2),
-            "zone":       self.zone,
-            "zone_label": self.zone_label,
+            "P_eff": round(self.P_eff, 2),
+            "zone":               self.zone,
+            "zone_label":         self.zone_label,
+            "marginal_threshold": round(self.marginal_threshold, 2),
             "B_s": round(self.B_s, 2),
             "S_E": round(self.S_E, 2),
             "t_star_raw":      round(self.t_star, 1) if self.t_star != math.inf else None,
@@ -237,13 +289,16 @@ class ModelV2Layer1:
         print(f"  MODEL V.2 — LAYER 1: INSTANTANEOUS STATE")
         print(f"{'='*60}")
         print(f"  ── Three Forces ──────────────────────────────────────")
-        print(f"  Propulsion   F_p  = ฿{r['F_p']:>10,.2f}")
-        print(f"  Debt Gravity F_g  = ฿{r['F_g']:>10,.2f}")
-        print(f"  Spending Drag F_d = ฿{r['F_d']:>10,.2f}  (β={r['beta']})")
-        print(f"  Net Force    F_net= ฿{r['F_net']:>10,.2f}")
+        print(f"  Propulsion    F_p  = ฿{r['F_p']:>10,.2f}")
+        print(f"  Debt Gravity  F_g  = ฿{r['F_g']:>10,.2f}")
+        print(f"  Spending Drag F_d  = ฿{r['F_d']:>10,.2f}  (β={r['beta']}  κ={r['kappa']})")
+        print(f"  Net Force     F_net= ฿{r['F_net']:>10,.2f}")
+        print(f"  Eff. Payment  P_eff= ฿{r['P_eff']:>10,.2f}")
         print(f"\n  ── Escape Score ──────────────────────────────────────")
-        print(f"  S_E = {r['S_E']:+.1f}  (B_s bonus = +{r['B_s']:.1f})")
+        print(f"  κ   = {r['kappa']:.4f}  (escape velocity multiple)")
+        print(f"  S_E = {r['S_E']:+.1f}  (marginal threshold = {r['marginal_threshold']:.1f})")
         print(f"  Zone: {r['zone_label']}")
+        print(f"  B_s = {r['B_s']:.1f}  (safety buffer, diagnostic only)")
         print(f"\n  ── Time to Debt Freedom ──────────────────────────────")
         print(f"  t* (raw)      = {r['t_star_raw']} months")
         print(f"  t* (adjusted) = {r['t_star_adjusted']} months  →  {r['t_star_display']}")
@@ -279,7 +334,6 @@ class ModelV2Layer2:
 
     @property
     def HCDF(self) -> float:
-        """HCDF = (t_retire - t_current) / (t_retire - t_start)"""
         denom = self.t_retire - self.t_start
         if denom <= 0:
             return 0.0
@@ -295,9 +349,6 @@ class ModelV2Layer2:
 
     @property
     def LDER(self) -> float:
-        """
-        LDER = D0 * e^(r*T) / Σ (I*12) * HCDF * (1-λ)^t / (1+d)^t
-        """
         D0  = self.layer1.D
         r   = self.layer1.r
         I   = self.layer1.I
@@ -332,16 +383,6 @@ class ModelV2Layer2:
 
     @property
     def R(self) -> float:
-        """
-        Lifetime Income Commitment Ratio.
-        R = (P * t*_adjusted) / (I * 12 * years_to_retirement)
-
-        What fraction of total remaining lifetime income is already
-        committed to debt repayment. No career curve assumptions —
-        every number comes directly from user inputs.
-
-        Returns math.inf if orbit-locked or no remaining income.
-        """
         if self.layer1.t_star == math.inf:
             return math.inf
         remaining_income = self.layer1.I * 12 * (self.t_retire - self.current_age)
@@ -351,44 +392,22 @@ class ModelV2Layer2:
         return total_debt_cost / remaining_income
 
     def true_event_horizon_warning(self) -> Optional[str]:
-        """
-        Fires based on R — Lifetime Income Commitment Ratio.
-
-        > 0.8  : True Event Horizon
-        > 0.5  : Critical
-        > 0.3  : Warning
-        = inf  : Orbit-locked (t* = inf)
-
-        Fully audit-proof: no peak age, no decay rate, no career assumptions.
-        Every number is directly traceable to user inputs.
-        """
         R = self.R
-
         if R == math.inf:
-            return (
-                "⚫ True Event Horizon — debt is orbit-locked. "
-                "100%+ of your remaining lifetime income cannot cover this debt."
-            )
-
+            return ("⚫ True Event Horizon — debt is orbit-locked. "
+                    "100%+ of your remaining lifetime income cannot cover this debt.")
         remaining_income = self.layer1.I * 12 * (self.t_retire - self.current_age)
         if remaining_income <= 0:
             return None
-
         if R > 0.8:
-            return (
-                f"⚫ True Event Horizon — {R*100:.0f}% of your remaining "
-                f"lifetime income is already committed to debt."
-            )
+            return (f"⚫ True Event Horizon — {R*100:.0f}% of your remaining "
+                    f"lifetime income is already committed to debt.")
         elif R > 0.5:
-            return (
-                f"🔴 Critical — {R*100:.0f}% of your remaining "
-                f"lifetime income is already committed to debt."
-            )
+            return (f"🔴 Critical — {R*100:.0f}% of your remaining "
+                    f"lifetime income is already committed to debt.")
         elif R > 0.3:
-            return (
-                f"⚠️  Warning — {R*100:.0f}% of your remaining "
-                f"lifetime income is already committed to debt."
-            )
+            return (f"⚠️  Warning — {R*100:.0f}% of your remaining "
+                    f"lifetime income is already committed to debt.")
         return None
 
     def compute(self) -> dict:
