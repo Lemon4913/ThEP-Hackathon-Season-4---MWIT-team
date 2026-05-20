@@ -37,7 +37,9 @@ from typing import Optional, Callable, List
 from debt_portfolio  import DebtPortfolio
 from debt_instruments import DebtInstrument
 
-
+# Utillity function to convert annual rate to compound-equivalent monthly rate
+def annual_to_monthly(annual_rate: float) -> float:
+    return (1 + annual_rate) ** (1/12) - 1
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Simulation primitives
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,23 +140,35 @@ def _simulate(
     month          = 0
 
     while month < max_months:
-        month += 1
-        
-        # คัดกรองหนี้ที่ยังจ่ายไม่หมด ณ ต้นเดือนจริง ๆ
+
         active = [d for d in debts if not d.paid_off and d.balance > 0.01]
         if not active:
             break
 
+        month += 1
+
         month_interest = 0.0
         month_payment  = 0.0
-
+        payments_made = {}
+        scheduled_payments = {}
+        
         # Step 1 — ทบดอกเบี้ยเข้าเงินต้นก่อน แล้วตัดจ่ายด้วยเงินขั้นต่ำ (ตามที่คุณดีไซน์)
         for d in active:
             interest = d.balance * d.monthly_rate
             d.balance += interest
             
+            required_interest_payment = interest
+            if d.min_payment < required_interest_payment:
+                raise ValueError(
+                    f"Negative amortization detected in debt '{d.name}'. "
+                    f"Minimum payment does not cover interest."
+                )
+            
             # ยอดที่ต้องจ่ายจริงในงวดนี้ (ไม่เกินยอดหนี้รวมดอกเบี้ย)
             actual_min_payment = min(d.min_payment, d.balance)
+            scheduled_payments[d.name] = d.min_payment
+            payments_made[d.name]      = actual_min_payment
+            
             d.balance -= actual_min_payment
             
             # บันทึกสถิติเม็ดเงิน
@@ -162,24 +176,30 @@ def _simulate(
             month_interest += interest
             month_payment  += actual_min_payment
 
-        # Step 2 — นำเงิน Extra Pool ไปโปะหนี้ตามลำดับความสำคัญ (กรองเฉพาะก้อนที่ยังเหลือเงินต้น > 0.01)
-        priority_order = priority_fn([d for d in debts if not d.paid_off and d.balance > 0.01])
+        # Step 2 — Immediate cascade + extra allocation
         remaining_extra = extra_pool
-        
+        for d in active:
+            if d.balance <= 0.01 and not d.paid_off:
+                d.paid_off = True
+                d.balance = 0.0
+                remaining_extra += scheduled_payments[d.name]
+        priority_order = priority_fn([d for d in debts if not d.paid_off and d.balance > 0.01])
         for pd in priority_order:
             if remaining_extra <= 0.01:
                 break
-            applied          = min(remaining_extra, pd.balance)
-            pd.balance      -= applied
+
+            applied = min(remaining_extra, pd.balance)
+
+            pd.balance -= applied
             remaining_extra -= applied
-            month_payment   += applied
+            month_payment += applied
 
         # Step 3 — ตรวจสอบหนี้ที่เคลียร์จบในเดือนนี้ มาร์กปิดบัญชี และส่งต่อเงินขั้นต่ำเข้าคาสเคด
         for d in active:
             if d.balance <= 0.01 and not d.paid_off:
                 d.paid_off  = True
                 d.balance   = 0.0
-                extra_pool += d.min_payment  # คาสเคดเงินขั้นต่ำเพื่อไปใช้ทบโปะก้อนอื่นในเดือนถัดไป
+                extra_pool += scheduled_payments[d.name]  # คาสเคดเงินขั้นต่ำเพื่อไปใช้ทบโปะก้อนอื่นในเดือนถัดไป
 
         # บันทึกสถานะสิ้นเดือน (Snapshot)
         alive     = [d for d in debts if not d.paid_off]
@@ -198,6 +218,12 @@ def _simulate(
             debts_remaining = len(alive),
         ))
 
+    remaining = [d for d in debts if d.balance > 0.01]
+    if remaining:
+        raise RuntimeError(
+            f"Simulation did not converge after {max_months} months."
+        )
+    
     return round(total_interest, 2), month, snapshots
 
 
@@ -262,7 +288,7 @@ def apply_retention(
     debts = [copy.copy(d) for d in sim_debts]
     for d in debts:
         if d.name == target_name:
-            new_r         = new_annual_rate / 12
+            new_r         = annual_to_monthly(new_annual_rate)
             d.min_payment = max(
                 _amortizing_payment(d.balance, new_r, new_term_months),
                 d.monthly_interest,   # floor: at least cover interest
@@ -280,7 +306,7 @@ def apply_retention_all(
     debts = [copy.copy(d) for d in sim_debts]
     for d in debts:
         new_annual = max(0.01, d.effective_annual_rate - rate_reduction)
-        new_r      = new_annual / 12
+        new_r          = annual_to_monthly(new_annual)
         d.min_payment  = max(
             _amortizing_payment(d.balance, new_r, new_term_months),
             d.balance * new_r,
@@ -306,10 +332,12 @@ def apply_refinance(
         if d.name == target_name:
             fee            = d.balance * fee_pct + fee_fixed
             new_balance    = d.balance + fee
-            new_r          = new_annual_rate / 12
+            new_r          = annual_to_monthly(new_annual_rate)
             d.balance      = new_balance
             d.monthly_rate = new_r
-            d.min_payment  = _amortizing_payment(new_balance, new_r, new_term_months)
+            new_payment = _amortizing_payment(new_balance,new_r,new_term_months)
+            d.min_payment = new_payment
+            
     return debts
 
 
@@ -338,8 +366,9 @@ def apply_consolidation(
     total_bal   = sum(d.balance for d in to_merge)
     fee         = total_bal * fee_pct + fee_fixed
     new_balance = total_bal + fee
-    new_r       = new_annual_rate / 12
-    new_pmt     = _amortizing_payment(new_balance, new_r, new_term_months)
+    new_r       = annual_to_monthly(new_annual_rate)
+    original_total_payment = sum(d.min_payment for d in to_merge)
+    new_pmt = _amortizing_payment(new_balance,new_r,new_term_months)
 
     consolidated = SimDebt(
         name         = f"Consolidated [{new_annual_rate*100:.1f}% / {new_term_months}mo]",
