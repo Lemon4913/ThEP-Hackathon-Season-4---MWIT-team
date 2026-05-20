@@ -125,28 +125,22 @@ def _simulate(
 ) -> tuple:
     """
     Month-by-month debt paydown simulation.
-
-    Mechanics:
-      1. Each month: charge interest, apply minimum payment to every active debt.
-      2. Apply extra_pool (extra payment + any freed minimums) to the
-         highest-priority debt first (priority_fn determines order).
-      3. When a debt reaches zero its minimum payment cascades into extra_pool
-         — freed money always rolls forward to accelerate remaining debts.
-
-    Returns: (total_interest_paid: float, months: int, snapshots: list)
+    Refactored with precise interest accrual and rolling cascade logic.
     """
-    debts      = [copy.copy(d) for d in sim_debts]
+    debts = [copy.copy(d) for d in sim_debts]
     for d in debts:
         d.paid_off = False
         d.balance  = max(d.balance, 0.0)
 
     total_interest = 0.0
-    extra_pool     = extra_monthly   # grows via cascade as debts are retired
+    extra_pool     = extra_monthly   # เติบโตขึ้นเมื่อมีหนี้ถูกเคลียร์หมด (Cascade)
     snapshots      = []
     month          = 0
 
     while month < max_months:
         month += 1
+        
+        # คัดกรองหนี้ที่ยังจ่ายไม่หมด ณ ต้นเดือนจริง ๆ
         active = [d for d in debts if not d.paid_off and d.balance > 0.01]
         if not active:
             break
@@ -154,41 +148,47 @@ def _simulate(
         month_interest = 0.0
         month_payment  = 0.0
 
-        # Step 1 — charge interest and apply minimums to all active debts
+        # Step 1 — ทบดอกเบี้ยเข้าเงินต้นก่อน แล้วตัดจ่ายด้วยเงินขั้นต่ำ (ตามที่คุณดีไซน์)
         for d in active:
-            interest      = d.balance * d.monthly_rate
-            min_principal = max(0.0, min(d.min_payment - interest, d.balance))
-            d.balance    -= min_principal
+            interest = d.balance * d.monthly_rate
+            d.balance += interest
+            
+            # ยอดที่ต้องจ่ายจริงในงวดนี้ (ไม่เกินยอดหนี้รวมดอกเบี้ย)
+            actual_min_payment = min(d.min_payment, d.balance)
+            d.balance -= actual_min_payment
+            
+            # บันทึกสถิติเม็ดเงิน
             total_interest += interest
             month_interest += interest
-            month_payment  += min(d.min_payment, d.balance + d.min_payment)
+            month_payment  += actual_min_payment
 
-        # Step 2 — apply extra_pool to priority debts (first → last in list)
-        priority_order  = priority_fn([d for d in debts
-                                       if not d.paid_off and d.balance > 0.01])
+        # Step 2 — นำเงิน Extra Pool ไปโปะหนี้ตามลำดับความสำคัญ (กรองเฉพาะก้อนที่ยังเหลือเงินต้น > 0.01)
+        priority_order = priority_fn([d for d in debts if not d.paid_off and d.balance > 0.01])
         remaining_extra = extra_pool
+        
         for pd in priority_order:
             if remaining_extra <= 0.01:
                 break
-            applied        = min(remaining_extra, pd.balance)
-            pd.balance    -= applied
+            applied          = min(remaining_extra, pd.balance)
+            pd.balance      -= applied
             remaining_extra -= applied
-            month_payment  += applied
+            month_payment   += applied
 
-        # Step 3 — mark newly paid-off debts, cascade their minimums
+        # Step 3 — ตรวจสอบหนี้ที่เคลียร์จบในเดือนนี้ มาร์กปิดบัญชี และส่งต่อเงินขั้นต่ำเข้าคาสเคด
         for d in active:
             if d.balance <= 0.01 and not d.paid_off:
                 d.paid_off  = True
                 d.balance   = 0.0
-                extra_pool += d.min_payment      # ← cascade
+                extra_pool += d.min_payment  # คาสเคดเงินขั้นต่ำเพื่อไปใช้ทบโปะก้อนอื่นในเดือนถัดไป
 
-        # Snapshot
-        alive         = [d for d in debts if not d.paid_off]
-        total_bal     = sum(d.balance for d in alive)
-        w_rate        = (
+        # บันทึกสถานะสิ้นเดือน (Snapshot)
+        alive     = [d for d in debts if not d.paid_off]
+        total_bal = sum(d.balance for d in alive)
+        w_rate    = (
             sum(d.balance * d.effective_annual_rate for d in alive) / total_bal
             if total_bal > 0 else 0.0
         )
+        
         snapshots.append(MonthlySnapshot(
             month           = month,
             total_balance   = round(total_bal, 2),
@@ -199,6 +199,7 @@ def _simulate(
         ))
 
     return round(total_interest, 2), month, snapshots
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
