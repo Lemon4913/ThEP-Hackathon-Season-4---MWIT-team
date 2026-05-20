@@ -17,7 +17,6 @@ from debt_instruments import (
 from debt_portfolio import DebtPortfolio
 from model_v2 import ModelV2Layer1, ModelV2Layer2, ModelV2Layer3
 
-
 def run_demo():
     print("\n" + "="*60)
     print("  DEBT → PORTFOLIO → MODEL V.2  |  Full Pipeline Demo")
