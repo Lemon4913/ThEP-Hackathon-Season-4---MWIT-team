@@ -1,5 +1,4 @@
-from flask import Flask, render_template, jsonify, request
-from datetime import datetime
+from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
@@ -7,15 +6,13 @@ app = Flask(__name__)
 def index():
     return render_template("index.html")
 
-@app.route("/api/greet", methods=["POST"])
+@app.route("/greet", methods=["POST"])
 def greet():
-    data = request.json
-    name = data.get("name", "World").strip() or "World"
-    now = datetime.now().strftime("%H:%M:%S")
-    return jsonify({
-        "message": f"Hello, {name}!",
-        "time": now
-    })
+    data = request.get_json()
+    username = data.get("username", "").strip()
+    if not username:
+        return jsonify({"error": "Please enter your name!"}), 400
+    return jsonify({"message": f"Hello, {username}! 👋"})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0", port=5000)

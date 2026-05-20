@@ -11,6 +11,7 @@ POST /api/portfolio/summary          Portfolio aggregates only (D, r, P, breakdo
 POST /api/layer1                     Model V.2 Layer 1 only (forces, zone, t*, gap)
 POST /api/layer2                     Model V.2 Layer 2 only (HCDF, LDER, trajectory)
 POST /api/layer3                     Model V.2 Layer 3 only (debt quality, VM badge)
+POST /api/nudge                      Nudge Engine — top 3 zone-change recommendations
 POST /api/debt/amortization          Amortization schedule for a single debt
 POST /api/debt/payoff                Payoff quote (with full fee stack)
 GET  /api/debt/types                 List supported debt types + required fields
@@ -47,6 +48,7 @@ from debt_instruments_extended import (
 )
 from debt_portfolio import DebtPortfolio
 from model_v2 import ModelV2Layer1, ModelV2Layer2, ModelV2Layer3
+from nudge_engine import NudgeEngine, BEHAVIOR_ACTIONS, ZONE_LABELS
 
 from datetime import date
 
@@ -422,11 +424,23 @@ def portfolio_analyze():
         )
         layer3 = ModelV2Layer3(portfolio_inputs=model_inputs)
 
+        nudge_engine = NudgeEngine(
+            layer1=layer1,
+            layer2=layer2,
+            behavior_questions=data.get("behavior_questions"),
+        )
+
         result = {
-            "portfolio": model_inputs,
-            "layer1":    layer1.compute(),
-            "layer2":    layer2.compute(),
-            "layer3":    layer3.compute(),
+            "portfolio":    model_inputs,
+            "layer1":       layer1.compute(),
+            "layer2":       layer2.compute(),
+            "layer3":       layer3.compute(),
+            "nudge_summary": {
+                "current_zone":    layer1.zone,
+                "zone_label":      layer1.zone_label,
+                "already_escaped": layer1.zone == "escape_trajectory",
+                "num_nudges":      len(nudge_engine.generate()),
+            },
         }
         return jsonify(_sanitize(result))
     except Exception as e:
@@ -500,7 +514,189 @@ def debt_payoff():
         return _err(str(e))
 
 
+@app.post("/api/nudge")
+def nudge():
+    """
+    Nudge Engine — top 3 zone-change recommendations.
+
+    Input: same fields as /api/portfolio/analyze  (debts + profile + career)
+      Plus optional:
+        "behavior_questions": [0,2,1,2,1]   list of 0-3 scores for 5 habit questions
+                                             (0 = never, 3 = always).
+                                             Drives specific habit hints in the response.
+
+    Output:
+      {
+        "current_zone":  "debt_orbit",
+        "zone_label":    "⚠️  Debt Orbit",
+        "S_E":           -3.2,
+        "t_star":        "4 years 2 months",
+        "beta":          1.4,
+        "already_escaped": false,
+        "nudges": [
+          {
+            "rank": 1,
+            "type": "single",          // "single" | "mix"
+            "lever_name": "Spending cut",
+            "lever_field": "E_d",
+            "steps": 1,
+            "pct_change": 10.0,
+            "base_value": 15000,
+            "new_value": 13500,
+            "new_SE": 1.8,
+            "delta_SE": 5.0,
+            "delta_t_months": 8,       // null if still orbit-locked
+            "new_zone": "marginal_escape",
+            "zone_upgraded": true,
+            "unlocks_orbit": false,
+            "drag_saved": null,        // ฿ for spending-cut nudge, else null
+            "behavior_hint": null,     // string hint for behavior-score nudge
+            "mix_parts": null          // populated only for type="mix"
+          },
+          ...
+        ]
+      }
+    """
+    data = request.get_json(silent=True) or {}
+    if not data.get("debts"):
+        return _err("'debts' array is required")
+    try:
+        portfolio    = _build_portfolio(data["debts"])
+        model_inputs = portfolio.to_model_v2_inputs()
+        layer1       = _build_layer1(data, model_inputs)
+        layer2       = ModelV2Layer2(
+            layer1      = layer1,
+            current_age = int(data.get("current_age", 35)),
+            career_type = data.get("career_type", "technical_engineering"),
+            t_start     = int(data.get("t_start", 22)),
+            t_retire    = int(data.get("t_retire", 60)),
+        )
+        behavior_questions = data.get("behavior_questions", None)
+        engine = NudgeEngine(
+            layer1=layer1,
+            layer2=layer2,
+            behavior_questions=behavior_questions,
+        )
+        raw_nudges = engine.generate()
+
+        # ── Serialise nudges into clean, frontend-friendly dicts ──────────────
+        clean_nudges = []
+        for n in raw_nudges:
+            is_mix = n["type"] == "mix"
+            entry  = {
+                "rank":          n["rank"],
+                "type":          n["type"],
+                "new_SE":        n.get("new_SE"),
+                "delta_SE":      n.get("delta_SE"),
+                "new_zone":      n.get("new_zone"),
+                "new_zone_label":ZONE_LABELS.get(n.get("new_zone", ""), n.get("new_zone", "")),
+                "zone_upgraded": n.get("zone_upgraded", False),
+                "unlocks_orbit": n.get("unlocks_orbit", False),
+                "delta_t_months":n.get("delta_t"),   # months faster (positive) or None
+            }
+
+            if is_mix:
+                # Mix nudge — multiple levers combined
+                entry.update({
+                    "label":       n.get("label"),
+                    "total_steps": n.get("steps"),
+                    "mix_parts":   [
+                        {
+                            "name":      p["name"],
+                            "field":     p["field"],
+                            "steps":     p["steps"],
+                            "pct_change":p["pct"],
+                            "base_value":p["base_val"],
+                            "new_value": p["new_val"],
+                            "direction": p["sign"],
+                        }
+                        for p in n.get("parts", [])
+                    ],
+                    # single-lever fields not applicable
+                    "lever_name":    None,
+                    "lever_field":   None,
+                    "steps":         None,
+                    "pct_change":    None,
+                    "base_value":    None,
+                    "new_value":     None,
+                    "drag_saved":    None,
+                    "behavior_hint": None,
+                })
+            else:
+                # Single-lever nudge
+                lev       = n["lev"]
+                base_val  = getattr(layer1, lev["field"])
+                new_val   = n["new_val"]
+
+                # Extra context for spending-cut lever
+                drag_saved = None
+                if lev["field"] == "E_d":
+                    drag_saved = round((base_val - new_val) * layer1.beta, 2)
+
+                # Extra context for behavior-score lever
+                behavior_hint = None
+                if lev["field"] == "behavior_score" and behavior_questions:
+                    for i, q in enumerate(behavior_questions[:5]):
+                        if q < 2:
+                            behavior_hint = BEHAVIOR_ACTIONS[i]
+                            break
+
+                entry.update({
+                    "lever_name":    lev["name"],
+                    "lever_field":   lev["field"],
+                    "lever_unit":    lev["unit"],
+                    "steps":         n["steps"],
+                    "pct_change":    round(n["pct"], 1),
+                    "base_value":    base_val,
+                    "new_value":     new_val,
+                    "drag_saved":    drag_saved,
+                    "behavior_hint": behavior_hint,
+                    "mix_parts":     None,
+                    "label":         None,
+                    "total_steps":   None,
+                })
+
+            clean_nudges.append(entry)
+
+        result = {
+            "current_zone":    layer1.zone,
+            "zone_label":      layer1.zone_label,
+            "S_E":             round(layer1.S_E, 2),
+            "t_star":          layer1.t_star_display(),
+            "beta":            round(layer1.beta, 3),
+            "already_escaped": layer1.zone == "escape_trajectory",
+            "teh_warning":     layer2.true_event_horizon_warning(),
+            "nudges":          clean_nudges,
+        }
+        return jsonify(_sanitize(result))
+
+    except Exception as e:
+        return _err(f"{e}\n{traceback.format_exc()}")
+
+
 # ── Dev server ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    import socket
+
+    PORT = 5000
+
+    # Resolve the machine's LAN IP by opening a dummy UDP socket
+    # (no data is sent — this just asks the OS which interface it would use)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        lan_ip = "unknown"
+
+    print("\n" + "=" * 52)
+    print("  Debt API server starting")
+    print("=" * 52)
+    print(f"  Local  :  http://127.0.0.1:{PORT}")
+    print(f"  Network:  http://{lan_ip}:{PORT}  <- use this on phone")
+    print("=" * 52 + "\n")
+
+    # host="0.0.0.0" binds to all interfaces (localhost + LAN + WiFi)
+    app.run(host="0.0.0.0", port=PORT, debug=True)
