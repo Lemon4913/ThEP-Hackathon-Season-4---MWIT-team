@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hello Flask</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-indigo-50 to-purple-50 flex items-center justify-center p-4">
+
+  <div class="bg-white rounded-2xl shadow-lg p-10 w-full max-w-md text-center">
+    <div class="text-5xl mb-4">🐍</div>
+    <h1 class="text-2xl font-semibold text-gray-800 mb-1">Flask Hello World</h1>
+    <p class="text-sm text-gray-400 mb-8">Your first Python web app is live!</p>
+
+    <div class="flex gap-2 mb-4">
+      <input
+        id="name-input"
+        type="text"
+        placeholder="Enter your name..."
+        class="flex-1 border border-gray-200 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+        onkeydown="if(event.key==='Enter') greet()"
+      />
+      <button
+        onclick="greet()"
+        class="bg-indigo-500 hover:bg-indigo-600 text-white text-sm font-medium px-5 py-2 rounded-lg transition"
+      >
+        Say Hello
+      </button>
+    </div>
+
+    <div id="result" class="hidden mt-6 p-4 bg-indigo-50 rounded-xl">
+      <p id="message" class="text-xl font-semibold text-indigo-700"></p>
+      <p id="time" class="text-xs text-gray-400 mt-1"></p>
+    </div>
+
+    <div class="mt-10 pt-6 border-t border-gray-100 text-left space-y-2">
+      <p class="text-xs font-medium text-gray-400 uppercase tracking-wide">How it works</p>
+      <div class="flex items-start gap-2 text-xs text-gray-500">
+        <span class="text-indigo-400 mt-0.5">①</span>
+        <span>Button click sends a <code class="bg-gray-100 px-1 rounded">POST /api/greet</code> request from JS</span>
+      </div>
+      <div class="flex items-start gap-2 text-xs text-gray-500">
+        <span class="text-indigo-400 mt-0.5">②</span>
+        <span>Flask receives it, builds a response with your name + timestamp</span>
+      </div>
+      <div class="flex items-start gap-2 text-xs text-gray-500">
+        <span class="text-indigo-400 mt-0.5">③</span>
+        <span>JS displays the JSON response in the card above</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function greet() {
+      const name = document.getElementById("name-input").value;
+
+      const res = await fetch("/api/greet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+
+      const data = await res.json();
+
+      document.getElementById("message").textContent = data.message;
+      document.getElementById("time").textContent = "Server time: " + data.time;
+      document.getElementById("result").classList.remove("hidden");
+    }
+  </script>
+
+</body>
+</html>
