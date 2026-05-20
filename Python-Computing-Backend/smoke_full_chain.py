@@ -18,7 +18,7 @@ from debt_instruments_extended import (CooperativeDebt, StepUpRateDebt,
 from debt_portfolio            import DebtPortfolio
 from model_v2                  import ModelV2Layer1, ModelV2Layer2
 from nudge_engine              import NudgeEngine
-
+from debt_instruments_extended import AnnualStepUpDebt
 
 # ── 1. Build debt instruments ─────────────────────────────────────────────────
 #
