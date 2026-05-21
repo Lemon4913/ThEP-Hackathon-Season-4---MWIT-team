@@ -192,8 +192,8 @@ class ModelV2Layer1:
             return math.inf
         M = self.momentum_index
         if M >= 0.8:   return t
-        elif M >= 0.5: return t # * 1.20
-        else:          return t # * 1.50
+        elif M >= 0.5: return t * # 1.20
+        else:          return t * # 1.50
 
     def t_star_display(self) -> str:
         t = self.t_star_adjusted
